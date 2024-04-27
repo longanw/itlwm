@@ -1179,7 +1179,7 @@ iwm_rx_tx_ba_notif(struct iwm_softc *sc, struct iwm_rx_packet *pkt, struct iwm_r
     if (qid != IWM_FIRST_AGG_TX_QUEUE + ba_notif->tid)
         return;
     
-    sc->sc_tx_timer = 0;
+    sc->sc_tx_timer[qid] = 0;
     
     ba = &ni->ni_tx_ba[ba_notif->tid];
     if (ba->ba_state != IEEE80211_BA_AGREED)
@@ -1236,8 +1236,6 @@ iwm_ampdu_tx_done(struct iwm_softc *sc, struct iwm_cmd_header *cmd_hdr,
     int txfail = (status != IWM_TX_STATUS_SUCCESS &&
                   status != IWM_TX_STATUS_DIRECT_DONE);
     struct ieee80211_tx_ba *ba;
-    
-    sc->sc_tx_timer = 0;
     
     if (ic->ic_state != IEEE80211_S_RUN)
         return;
@@ -1314,6 +1312,7 @@ iwm_rx_tx_cmd_single(struct iwm_softc *sc, struct iwm_tx_resp *tx_resp,
             skb_freed++;
 
             memset(&info->status, 0, sizeof(info->status));
+            info->flags &= ~(IEEE80211_TX_STAT_ACK | IEEE80211_TX_STAT_TX_FILTERED);
 
             /* inform mac80211 about what happened with the frame */
             switch (status & IWM_TX_STATUS_MSK) {
@@ -1404,11 +1403,9 @@ iwm_txd_done(struct iwm_softc *sc, struct iwm_tx_data *txd)
     ieee80211_release_node(ic, &txd->in->in_ni);
     txd->in = NULL;
     txd->totlen = 0;
-    txd->ampdu_txmcs = 0;
     txd->txmcs = 0;
     txd->txrate = 0;
     txd->fc = 0;
-    txd->ampdu_nframes = 0;
     memset(&txd->info, 0, sizeof(struct ieee80211_tx_info));
 }
 
@@ -1444,8 +1441,8 @@ iwm_rx_tx_cmd(struct iwm_softc *sc, struct iwm_rx_packet *pkt,
     struct iwm_cmd_header *cmd_hdr = &pkt->hdr;
     int idx = cmd_hdr->idx;
     int qid = cmd_hdr->qid;
-    struct iwm_tx_ring *ring = &sc->txq[qid];
-    struct iwm_tx_data *txd = &ring->data[idx];
+    struct iwm_tx_ring *ring;
+    struct iwm_tx_data *txd;
     struct iwm_tx_resp *tx_resp = (struct iwm_tx_resp *)pkt->data;
     uint32_t ssn;
     uint32_t len = iwm_rx_packet_len(pkt);
@@ -1453,8 +1450,6 @@ iwm_rx_tx_cmd(struct iwm_softc *sc, struct iwm_rx_packet *pkt,
     
     bus_dmamap_sync(sc->sc_dmat, data->map, 0, IWM_RBUF_SIZE,
                     BUS_DMASYNC_POSTREAD);
-    
-    sc->sc_tx_timer = 0;
     
     /* Sanity checks. */
     if (sizeof(*tx_resp) > len)
@@ -1466,6 +1461,11 @@ iwm_rx_tx_cmd(struct iwm_softc *sc, struct iwm_rx_packet *pkt,
     if (sizeof(*tx_resp) + sizeof(ssn) +
         tx_resp->frame_count * sizeof(struct iwm_agg_tx_status) > len)
         return;
+    
+    sc->sc_tx_timer[qid] = 0;
+    
+    ring = &sc->txq[qid];
+    txd = &ring->data[idx];
     
     if (tx_resp->frame_count > 1) {
         for (int i = 0; i < tx_resp->frame_count; i++) {
@@ -1539,6 +1539,25 @@ iwm_rx_bmiss(struct iwm_softc *sc, struct iwm_rx_packet *pkt,
     
 }
 
+static int
+iwm_rate2ridx(struct iwm_softc *sc, int rate)
+{
+    struct ieee80211com *ic = &sc->sc_ic;
+    struct ieee80211_node *ni = ic->ic_bss;
+    int ridx = -1, i;
+    
+    int min_ridx = (IEEE80211_IS_CHAN_5GHZ(ni->ni_chan)) ?
+        IWL_FIRST_OFDM_RATE : IWL_FIRST_CCK_RATE;
+    
+    for (i = 0; i < ieee80211_std_rateset_11g.rs_nrates; i++) {
+        if (ieee80211_std_rateset_11g.rs_rates[i] == rate) {
+            ridx = i;
+            break;
+        }
+    }
+    return ridx == -1 ? min_ridx : ridx;
+}
+
 /*
  * Fill in various bit for management frames, and leave them
  * unfilled for data frames (firmware takes care of that).
@@ -1553,54 +1572,35 @@ iwm_tx_fill_cmd(struct iwm_softc *sc, struct iwm_node *in,
     int type = wh->i_fc[0] & IEEE80211_FC0_TYPE_MASK;
     int subtype = wh->i_fc[0] & IEEE80211_FC0_SUBTYPE_MASK;
     int ridx = -1, rate_flags;
-    int min_ridx = (IEEE80211_IS_CHAN_5GHZ(ni->ni_chan)) ?
-    IWL_FIRST_OFDM_RATE : IWL_FIRST_CCK_RATE;
-    int i;
+    int min_ridx = iwm_rate2ridx(sc, ieee80211_min_basic_rate(ic));
     
-    int min_rate = ieee80211_min_basic_rate(ic);
-    for (i = 0; i < ieee80211_std_rateset_11g.rs_nrates; i++) {
-        if (ieee80211_std_rateset_11g.rs_rates[i] == min_rate) {
-            min_ridx = i;
-            break;
-        }
-    }
-
     tx->rts_retry_limit = IWM_RTS_DFAULT_RETRY_LIMIT;
     
-    if (type == IEEE80211_FC0_TYPE_CTL && subtype == IEEE80211_FC0_SUBTYPE_BAR)
+    if (type == IEEE80211_FC0_TYPE_CTL &&
+        subtype == IEEE80211_FC0_SUBTYPE_BAR)
         tx->data_retry_limit = IWM_BAR_DFAULT_RETRY_LIMIT;
     else
         tx->data_retry_limit = IWM_DEFAULT_TX_RETRY;
     
-    /*
-    * for data packets, rate info comes from the table inside the fw. This
-    * table is controlled by LINK_QUALITY commands
-    */
-    if (!IEEE80211_IS_MULTICAST(wh->i_addr1) &&
-        type == IEEE80211_FC0_TYPE_DATA) {
-        tx->initial_rate_index = 0;
-        tx->tx_flags |= cpu_to_le32(IWM_TX_CMD_FLG_STA_RATE);
-        return &iwl_rates[ridx];
-    } else if (type == IEEE80211_FC0_TYPE_CTL &&
-               subtype == IEEE80211_FC0_SUBTYPE_BAR)
-        tx->tx_flags |= htole32(IWM_TX_CMD_FLG_ACK | IWM_TX_CMD_FLG_BAR);
-
-    if (ic->ic_fixed_mcs != -1 ||
-        ic->ic_fixed_rate != -1)
-        ridx = sc->sc_fixed_ridx;
-    else {
+    if (IEEE80211_IS_MULTICAST(wh->i_addr1) ||
+        type != IEEE80211_FC0_TYPE_DATA) {
+        /* for non-data, use the lowest supported rate */
+        ridx = min_ridx;
+        tx->data_retry_limit = IWM_MGMT_DFAULT_RETRY_LIMIT;
+    } else if (ic->ic_fixed_mcs != -1) {
         if (ni->ni_flags & IEEE80211_NODE_VHT)
-            ridx = iwm_mcs2ridx[ni->ni_txmcs];
-        else if (ni->ni_flags & IEEE80211_NODE_HT)
-            ridx = iwm_mcs2ridx[ni->ni_txmcs % 8];
-        else {
-            for (i = 0; i < ieee80211_std_rateset_11g.rs_nrates; i++) {
-                if (ieee80211_std_rateset_11g.rs_rates[i] == ni->ni_txrate) {
-                    ridx = i;
-                    break;
-                }
-            }
-        }
+            ridx = IWL_FIRST_OFDM_RATE;
+        else
+            ridx = sc->sc_fixed_ridx;
+    } else if (ic->ic_fixed_rate != -1) {
+        ridx = sc->sc_fixed_ridx;
+     } else {
+        /* Use firmware rateset retry table. */
+        tx->initial_rate_index = 0;
+        tx->tx_flags |= htole32(IWM_TX_CMD_FLG_STA_RATE);
+        if (ni->ni_flags & IEEE80211_NODE_HT) /* VHT implies HT */
+            return 0;
+        return &iwl_rates[iwm_rate2ridx(sc, ni->ni_txrate)];
     }
     
     if (ridx == -1 || ridx >= IWL_RATE_COUNT_LEGACY)
@@ -1847,7 +1847,6 @@ iwm_tx(struct iwm_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)
     data->txmcs = ni->ni_txmcs;
     data->txrate = ni->ni_txrate;
     data->totlen = totlen;
-    data->ampdu_txmcs = ni->ni_txmcs;
     memcpy(&data->fc, &wh->i_fc[0], sizeof(uint16_t));
     data->info.band = IEEE80211_IS_CHAN_2GHZ(ni->ni_chan) ? NL80211_BAND_2GHZ : NL80211_BAND_5GHZ;
     
@@ -1898,6 +1897,9 @@ iwm_tx(struct iwm_softc *sc, mbuf_t m, struct ieee80211_node *ni, int ac)
 //        XYLog("%s qid=%d sc->qfullmsk is FULL ring->cur=%d ring->queued=%d\n", __FUNCTION__, ring->qid, ring->cur, ring->queued);
         sc->qfullmsk |= 1 << ring->qid;
     }
+    
+    if (ic->ic_if.if_flags & IFF_UP)
+        sc->sc_tx_timer[ring->qid] = 15;
     
     return 0;
 }
@@ -2800,6 +2802,9 @@ iwm_ampdu_rx_start(struct ieee80211com *ic, struct ieee80211_node *ni,
         tid > IWM_MAX_TID_COUNT)
         return ENOSPC;
     
+    if (ic->ic_state != IEEE80211_S_RUN)
+        return ENOSPC;
+
     if (sc->ba_rx.start_tidmask & (1 << tid))
         return EBUSY;
     
@@ -2823,6 +2828,9 @@ iwm_ampdu_rx_stop(struct ieee80211com *ic, struct ieee80211_node *ni,
     if (tid > IWM_MAX_TID_COUNT || sc->ba_rx.stop_tidmask & (1 << tid))
         return;
     
+    if (ic->ic_state != IEEE80211_S_RUN)
+        return;
+
     sc->ba_rx.stop_tidmask |= (1 << tid);
     that->iwm_add_task(sc, systq, &sc->ba_task);
 }
@@ -3581,10 +3589,8 @@ _iwm_start_task(OSObject *target, void *arg0, void *arg1, void *arg2, void *arg3
         }
         ifp->netStat->outputPackets++;
         
-        if (ifp->if_flags & IFF_UP) {
-            sc->sc_tx_timer = 15;
+        if (ifp->if_flags & IFF_UP)
             ifp->if_timer = 1;
-        }
     }
     
     return kIOReturnSuccess;
@@ -3667,7 +3673,8 @@ iwm_stop(struct _ifnet *ifp)
         iwm_clear_reorder_buffer(sc, rxba);
     }
     iwm_led_blink_stop(sc);
-    ifp->if_timer = sc->sc_tx_timer = 0;
+    memset(sc->sc_tx_timer, 0, sizeof(sc->sc_tx_timer));
+    ifp->if_timer = 0;
     
     splx(s);
 }
@@ -3677,22 +3684,31 @@ iwm_watchdog(struct _ifnet *ifp)
 {
     struct iwm_softc *sc = (struct iwm_softc *)ifp->if_softc;
     ItlIwm *that = container_of(sc, ItlIwm, com);
+    int i;
     
     ifp->if_timer = 0;
-    if (sc->sc_tx_timer > 0) {
-        if (--sc->sc_tx_timer == 0) {
-            XYLog("%s: device timeout\n", DEVNAME(sc));
+
+    /*
+     * We maintain a separate timer for each Tx queue because
+     * Tx aggregation queues can get "stuck" while other queues
+     * keep working. The Linux driver uses a similar workaround.
+     */
+    for (i = 0; i < nitems(sc->sc_tx_timer); i++) {
+        if (sc->sc_tx_timer[i] > 0) {
+            if (--sc->sc_tx_timer[i] == 0) {
+                XYLog("%s: device timeout\n", DEVNAME(sc));
 #ifdef IWM_DEBUG
-            that->iwm_nic_error(sc);
+                that->iwm_nic_error(sc);
 #endif
-            if ((sc->sc_flags & IWM_FLAG_SHUTDOWN) == 0) {
-                task_add(systq, &sc->init_task);
+                if ((sc->sc_flags & IWM_FLAG_SHUTDOWN) == 0) {
+                    task_add(systq, &sc->init_task);
+                }
+                XYLog("%s %d OUTPUT_ERROR\n", __FUNCTION__, __LINE__);
+                ifp->netStat->outputErrors++;
+                return;
             }
-            XYLog("%s %d OUTPUT_ERROR\n", __FUNCTION__, __LINE__);
-            ifp->netStat->outputErrors++;
-            return;
+            ifp->if_timer = 1;
         }
-        ifp->if_timer = 1;
     }
     
     ieee80211_watchdog(ifp);
@@ -4439,7 +4455,6 @@ iwm_attach(struct iwm_softc *sc, struct pci_attach_args *pa)
     pcireg_t reg, memtype;
     struct ieee80211com *ic = &sc->sc_ic;
     struct _ifnet *ifp = &ic->ic_if;
-    const char *intrstr = {0};
     int err;
     int txq_i, i, j;
     
@@ -4496,7 +4511,7 @@ iwm_attach(struct iwm_softc *sc, struct pci_attach_args *pa)
             PCI_COMMAND_STATUS_REG, reg);
     }
     
-    int msiIntrIndex = 0;
+    int msiIntrIndex = -1;
     for (int index = 0; ; index++)
     {
         int interruptType;
@@ -4509,6 +4524,11 @@ iwm_attach(struct iwm_softc *sc, struct pci_attach_args *pa)
             break;
         }
     }
+    if (msiIntrIndex == -1) {
+        XYLog("%s: can't find MSI interrupt controller\n", DEVNAME(sc));
+        return false;
+    }
+
     if (sc->sc_msix)
         sc->sc_ih =
         IOFilterInterruptEventSource::filterInterruptEventSource(this,
@@ -4520,15 +4540,10 @@ iwm_attach(struct iwm_softc *sc, struct pci_attach_args *pa)
                                                                              (IOInterruptEventSource::Action)&ItlIwm::iwm_intr, &ItlIwm::intrFilter
                                                                              , pa->pa_tag, msiIntrIndex);
     if (sc->sc_ih == NULL || pa->workloop->addEventSource(sc->sc_ih) != kIOReturnSuccess) {
-        XYLog("\n");
-        XYLog("%s: can't establish interrupt", DEVNAME(sc));
-        if (intrstr != NULL)
-            XYLog(" at %s", intrstr);
-        XYLog("\n");
+        XYLog("%s: can't establish interrupt\n", DEVNAME(sc));
         return false;
     }
     sc->sc_ih->enable();
-    XYLog(", %s\n", intrstr);
     
     sc->sc_hw_rev = IWM_READ(sc, IWM_CSR_HW_REV);
     int pa_id = pa->pa_tag->configRead16(kIOPCIConfigDeviceID);
@@ -4788,7 +4803,7 @@ iwm_attach(struct iwm_softc *sc, struct pci_attach_args *pa)
     ic->ic_ampdu_params = (IEEE80211_AMPDU_PARAM_SS_4 | 0x3 /* 64k */);
     ic->ic_caps |= (IEEE80211_C_QOS | IEEE80211_C_TX_AMPDU | IEEE80211_C_AMSDU_IN_AMPDU);
     ic->ic_caps |= IEEE80211_C_SUPPORTS_VHT_EXT_NSS_BW;
-#if 1
+#if 0
     ic->ic_caps |= IEEE80211_C_TX_AMPDU_SETUP_IN_RS;
 #endif
     
